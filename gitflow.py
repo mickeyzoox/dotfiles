@@ -63,6 +63,9 @@ def active_branch_from_repo(repo, verbose=False):
     if repo is None:
         return None
     try:
+        # NOTE: Even in the case when we're in a worktree (and `repo` is actually the _parent_
+        # repository of the current worktree) empirically `repo.active_branch` returns the active
+        # branch (in the worktree!). Super creepy but things magically work.
         return repo.active_branch
     except TypeError as e:
         if verbose:
@@ -176,28 +179,53 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
+def worktree_dot_git_file_to_dot_git_dir(worktree_dot_git_file):
+    """
+    Take the `.git` file in a worktree and return the `.git` folder in the parent repo.
+
+    See https://git-scm.com/docs/git-worktree#_details for details of worktree folder structure.
+    """
+    GITDIR_PREFIX = "gitdir: "
+    with open(worktree_dot_git_file) as f:
+        worktree_file_contents = f.read().strip()
+    if not worktree_file_contents.startswith(GITDIR_PREFIX):
+        raise DagParseException(
+        "Unexpected contents of .git worktree file: '{}'".format(worktree_file_contents))
+    worktree_dir = worktree_file_contents[len(GITDIR_PREFIX):]
+    return os.path.dirname(os.path.dirname(worktree_dir))
+
+
 def main(argv=sys.argv[1:]):
     args = parse_args(argv)
     cwd = os.getcwd()
-    git_dir = os.path.join(cwd, '.git')
-    if not (os.path.exists(git_dir) and os.path.isdir(git_dir)):
-        raise DagParseException("Must be in git directory!")
-    cwd = os.path.expanduser(os.getcwd())
-    repo_dir = cwd
-    repo = git.Repo(repo_dir)
-    dag, roots = build_git_dag(repo)
+    dot_git_path = os.path.join(cwd, '.git')
+    if not os.path.exists(dot_git_path):
+        raise DagParseException(".git directory or file '{}' does not exist!".format(dot_git_path))
+
+    # NOTE: `gitpython` currently doesn't support worktrees
+    # (https://github.com/gitpython-developers/GitPython/issues/719), so if we're in a worktree we
+    # use the parent repo instead. This is fine for just computing a branch dag (which is the same
+    # across all worktrees) but may not work if we do crazier things.
+    if os.path.isfile(dot_git_path):
+        dot_git_path = worktree_dot_git_file_to_dot_git_dir(dot_git_path)
+
+    if not (os.path.exists(dot_git_path) and os.path.isdir(dot_git_path)):
+        raise DagParseException(".git '{}' must be in git directory!".format(dot_git_path))
+    parent_repo_dir = os.path.expanduser(os.path.dirname(dot_git_path))
+    parent_repo = git.Repo(parent_repo_dir)
+    dag, roots = build_git_dag(parent_repo)
 
     if args.branch:
         roots = [args.branch]
     elif args.cascade:
-        active_branch = active_branch_from_repo(repo, verbose=True)
+        active_branch = active_branch_from_repo(parent_repo, verbose=True)
         if active_branch is not None:
             roots = [branch_name(active_branch)]
-    print_dag(dag, roots, repo, args.cascade)
+    print_dag(dag, roots, parent_repo, args.cascade)
     # If performing a cascade, print out status again.
     if args.cascade:
         print('Status after cascade:')
-        print_dag(dag, roots, repo, False)
+        print_dag(dag, roots, parent_repo, False)
 
 
 if __name__ == '__main__':
